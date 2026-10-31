@@ -1,0 +1,204 @@
+#!/usr/bin/env bash
+#
+# apply: make the components table match the components config file.
+#
+# Usage:
+#   sudo -u sitewatch /opt/sitewatch/bin/apply [--dry-run] [config-file]
+#
+#   --dry-run    show what would change, change nothing
+#   config-file  defaults to /etc/sitewatch/components.conf
+#
+# Config format: one component per line, three fields separated by spaces:
+#   name   url   internal|external
+# Blank lines and lines starting with # are ignored.
+#
+# Exit codes: 0 = applied (or nothing to do), 1 = refused or failed, 2 = bad usage.
+# Nothing in the database changes unless the whole file is valid.
+
+set -euo pipefail
+
+CONFIG="/etc/sitewatch/components.conf"
+DB="${SITEWATCH_DB:-sitewatch_db}"
+RUN_AS="${SITEWATCH_USER:-sitewatch}"
+DRY_RUN=0
+
+usage() {
+    sed -n '3,15p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+# --- arguments ---------------------------------------------------------------
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --dry-run) DRY_RUN=1; shift ;;
+        -h|--help) usage; exit 0 ;;
+        -*)        echo "apply: unknown option '$1'" >&2; usage >&2; exit 2 ;;
+        *)         CONFIG="$1"; shift ;;
+    esac
+done
+
+if [[ "$(id -un)" != "$RUN_AS" ]]; then
+    echo "apply: must run as '$RUN_AS'. Try: sudo -u $RUN_AS $0" >&2
+    exit 1
+fi
+
+if [[ ! -r "$CONFIG" ]]; then
+    echo "apply: cannot read $CONFIG" >&2
+    exit 1
+fi
+
+# --- step 1: check the whole file, collect every error -----------------------
+
+name_re='^[a-z0-9][a-z0-9-]{0,31}$'
+url_re='^https?://[^[:space:]]+$'
+
+errors=()
+names=()
+urls=()
+internals=()
+declare -A first_seen_on
+
+line_no=0
+while IFS= read -r line || [[ -n "$line" ]]; do
+    line_no=$((line_no + 1))
+    line="${line%$'\r'}"                          # tolerate files saved on Windows
+
+    [[ "$line" =~ ^[[:space:]]*(#|$) ]] && continue   # blank line or comment
+
+    name="" url="" type="" extra=""
+    read -r name url type extra <<< "$line"
+
+    if [[ -z "$type" || -n "$extra" ]]; then
+        errors+=("line $line_no: expected 3 fields (name url type), got: $line")
+        continue
+    fi
+
+    if [[ ! "$name" =~ $name_re ]]; then
+        errors+=("line $line_no: invalid name '$name' (lowercase letters, digits and '-', max 32 characters)")
+    elif [[ -n "${first_seen_on[$name]:-}" ]]; then
+        errors+=("line $line_no: duplicate name '$name' (already used on line ${first_seen_on[$name]})")
+    else
+        first_seen_on[$name]=$line_no
+    fi
+
+    if [[ ! "$url" =~ $url_re ]]; then
+        errors+=("line $line_no: invalid url '$url' (must start with http:// or https://)")
+    fi
+
+    case "$type" in
+        internal) internal=true ;;
+        external) internal=false ;;
+        *)        errors+=("line $line_no: unknown type '$type' (use internal or external)"); internal="" ;;
+    esac
+
+    names+=("$name")
+    urls+=("$url")
+    internals+=("$internal")
+done < "$CONFIG"
+
+if [[ ${#errors[@]} -eq 0 && ${#names[@]} -eq 0 ]]; then
+    errors+=("no components found in $CONFIG; refusing, because applying it would retire every component")
+fi
+
+if [[ ${#errors[@]} -gt 0 ]]; then
+    echo "apply: $CONFIG has ${#errors[@]} problem(s), nothing was changed:" >&2
+    printf '  %s\n' "${errors[@]}" >&2
+    exit 1
+fi
+
+# --- step 2: make the database match, in one transaction ---------------------
+
+csv() {                                           # quote one value for CSV
+    local v="${1//\"/\"\"}"
+    printf '"%s"' "$v"
+}
+
+if [[ $DRY_RUN -eq 1 ]]; then
+    finish="rollback;"
+else
+    finish="commit;"
+fi
+
+build_sql() {
+    cat <<'SQL'
+begin;
+
+-- one apply at a time
+lock table components in exclusive mode;
+
+create temp table incoming (name text, url text, is_internal boolean) on commit drop;
+copy incoming from stdin with (format csv);
+SQL
+    local i
+    for i in "${!names[@]}"; do
+        printf '%s,%s,%s\n' "$(csv "${names[$i]}")" "$(csv "${urls[$i]}")" "${internals[$i]}"
+    done
+    printf '%s\n' '\.'
+    cat <<'SQL'
+
+-- work out what will change, before changing it
+create temp table changes (action text, name text) on commit drop;
+
+insert into changes
+select 'added', i.name
+from incoming i
+left join components c using (name)
+where c.id is null;
+
+insert into changes
+select case when c.is_active then 'updated' else 'reactivated' end, i.name
+from incoming i
+join components c using (name)
+where (c.url, c.is_internal, c.is_active) is distinct from (i.url, i.is_internal, true);
+
+insert into changes
+select 'retired', c.name
+from components c
+where c.is_active
+  and not exists (select 1 from incoming i where i.name = c.name);
+
+-- apply: insert new, update changed (unchanged rows are left alone)
+insert into components (name, url, is_internal, is_active)
+select name, url, is_internal, true from incoming
+on conflict (name) do update
+    set url = excluded.url, is_internal = excluded.is_internal, is_active = true
+    where (components.url, components.is_internal, components.is_active)
+          is distinct from (excluded.url, excluded.is_internal, true);
+
+-- retire, never delete: their history depends on them
+update components
+set is_active = false
+where is_active
+  and name not in (select name from incoming);
+
+select action, name from changes order by action, name;
+SQL
+    echo "$finish"
+}
+
+if ! result=$(build_sql | psql -X -q -At -F $'\t' -v ON_ERROR_STOP=1 -d "$DB" 2>&1); then
+    echo "apply: database update failed, nothing was changed:" >&2
+    echo "$result" | sed 's/^/  /' >&2
+    exit 1
+fi
+
+# --- step 3: report ----------------------------------------------------------
+
+if [[ -z "$result" ]]; then
+    echo "No changes: the database already matches $CONFIG (${#names[@]} components)."
+    exit 0
+fi
+
+declare -A count=([added]=0 [updated]=0 [reactivated]=0 [retired]=0)
+while IFS=$'\t' read -r action name; do
+    count[$action]=$((count[$action] + 1))
+    echo "  $action: $name"
+done <<< "$result"
+
+summary="added ${count[added]}, updated ${count[updated]}, reactivated ${count[reactivated]}, retired ${count[retired]}"
+if [[ $DRY_RUN -eq 1 ]]; then
+    echo "Dry run, nothing was changed. Would have: $summary."
+else
+    echo "Applied: $summary."
+fi
+
