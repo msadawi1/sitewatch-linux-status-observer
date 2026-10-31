@@ -1,0 +1,35 @@
+# Site Watch stand-in service, one copy per component.
+#
+# Start a copy with:   systemctl enable --now standin@login
+# Each copy reads its own settings from /etc/sitewatch/standin/<name>.env, e.g. login.env:
+#   STANDIN_NAME=login
+#   STANDIN_PORT=8003
+#   STANDIN_DELAY_MS=0      (optional; raise it to make the component slow)
+#
+# Install: copy this file to /etc/systemd/system/, then: systemctl daemon-reload
+
+[Unit]
+Description=Site Watch stand-in service (%i)
+After=network.target
+
+[Service]
+Type=simple
+User=sitewatch
+Group=sitewatch
+
+# Read by systemd itself (as root) before switching to sitewatch
+EnvironmentFile=/etc/sitewatch/standin/%i.env
+ExecStart=/opt/sitewatch/bin/standin
+
+# Restart after a crash, but not after a deliberate `systemctl stop`
+Restart=on-failure
+RestartSec=2
+
+# Least privilege: the stand-in only needs to answer HTTP, so lock down the rest
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
