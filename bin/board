@@ -1,0 +1,126 @@
+#!/usr/bin/env bash
+#
+# board: print the Site Watch status board.
+#
+# Installed as /usr/local/bin/sitewatch-board and run by the forced command
+# of the `status` user:   ssh status@<server>
+#
+# Reads only two views: checker_health and component_status.
+# Connects as the Linux user running it (peer authentication), so the
+# `status` role needs nothing more than SELECT on those two views.
+#
+# Settings (environment variables, all optional):
+#   SITEWATCH_DB   database name                (default: sitewatch_db)
+#   SITEWATCH_TZ   time zone for times shown    (default: Asia/Kuala_Lumpur)
+
+set -euo pipefail
+
+DB="${SITEWATCH_DB:-sitewatch_db}"
+TZ_SHOWN="${SITEWATCH_TZ:-Asia/Kuala_Lumpur}"
+
+# --- colours, only when printing to a terminal ------------------------------------
+
+if [[ -t 1 ]]; then
+    BOLD=$'\e[1m' DIM=$'\e[2m' RESET=$'\e[0m'
+    GREEN=$'\e[32m' YELLOW=$'\e[33m' ORANGE=$'\e[38;5;208m' RED=$'\e[31m'
+else
+    BOLD="" DIM="" RESET="" GREEN="" YELLOW="" ORANGE="" RED=""
+fi
+
+colour_for() {                                    # severity 0..3 -> colour
+    case "$1" in
+        0) printf '%s' "$GREEN" ;;
+        1) printf '%s' "$YELLOW" ;;
+        2) printf '%s' "$ORANGE" ;;
+        *) printf '%s' "$RED" ;;
+    esac
+}
+
+ago() {                                           # seconds -> "3 minutes ago"
+    local s="$1" n unit
+    if   (( s < 60 ));    then n=$s;            unit=second
+    elif (( s < 3600 ));  then n=$(( s / 60 ));    unit=minute
+    elif (( s < 86400 )); then n=$(( s / 3600 ));  unit=hour
+    else                       n=$(( s / 86400 )); unit=day
+    fi
+    (( n == 1 )) || unit="${unit}s"
+    printf '%d %s ago' "$n" "$unit"
+}
+
+# --- read the two views (one connection) ------------------------------------------
+
+query() {
+    psql -X -q -At -F '|' -v ON_ERROR_STOP=1 -v tz="$TZ_SHOWN" -d "$DB" <<'SQL'
+select 'health',
+       coalesce(to_char(last_checked_at at time zone :'tz', 'HH24:MI'), ''),
+       coalesce(extract(epoch from now() - last_checked_at)::bigint::text, ''),
+       is_stale
+from checker_health;
+
+select 'component', component_name, status, severity
+from component_status
+order by component_id;
+SQL
+}
+
+if ! rows="$(query 2>&1)"; then
+    echo "Site Watch: the status board is unavailable right now. Please try again shortly."
+    echo "${DIM}($rows)${RESET}" | head -n 1
+    exit 1
+fi
+
+last_time="" age_seconds="" stale="t"
+names=() statuses=() severities=()
+worst=-1 worst_status=""
+
+while IFS='|' read -r kind a b c; do
+    case "$kind" in
+        health)
+            last_time="$a"; age_seconds="$b"; stale="$c" ;;
+        component)
+            names+=("$a"); statuses+=("$b"); severities+=("$c")
+            if (( c > worst )); then worst=$c; worst_status="$b"; fi ;;
+    esac
+done <<< "$rows"
+
+# --- print -------------------------------------------------------------------------
+
+now_shown="$(TZ="$TZ_SHOWN" date '+%-d %b %Y, %H:%M')"
+
+echo
+printf '%sSITE WATCH STATUS%s%*s%s\n' "$BOLD" "$RESET" 30 "" "$now_shown"
+echo
+
+if [[ "$stale" == "t" ]]; then
+    printf '%sOverall: UNKNOWN%s\n\n' "$BOLD$RED" "$RESET"
+    if [[ -z "$last_time" ]]; then
+        printf '%s⚠ NO STATUS DATA YET.%s The checker has never run.\n' "$BOLD$RED" "$RESET"
+    else
+        printf '%s⚠ STATUS DATA IS STALE.%s Last check: %s (%s)\n' \
+            "$BOLD$RED" "$RESET" "$last_time" "$(ago "$age_seconds")"
+    fi
+    echo "  Monitoring may be down; component statuses can't be trusted right now."
+    echo
+    exit 0
+fi
+
+if (( ${#names[@]} == 0 )); then
+    printf '%sOverall: UNKNOWN%s\n\n' "$BOLD" "$RESET"
+    echo "  No components are being monitored."
+    echo
+    exit 0
+fi
+
+if (( worst == 0 )); then
+    overall="ALL SYSTEMS OPERATIONAL"
+else
+    overall="${worst_status^^}"
+fi
+printf '%sOverall: %s%s%s\n\n' "$BOLD" "$(colour_for "$worst")" "$overall" "$RESET"
+
+for i in "${!names[@]}"; do
+    printf '  %-12s %s%s%s\n' "${names[$i]}" "$(colour_for "${severities[$i]}")" "${statuses[$i]}" "$RESET"
+done
+
+echo
+printf '%sLast check: %s (%s)%s\n\n' "$DIM" "$last_time" "$(ago "$age_seconds")" "$RESET"
