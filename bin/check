@@ -1,0 +1,148 @@
+#!/usr/bin/env bash
+#
+# check: check every active component once and record the results in the checks table.
+#
+# Meant to run every minute from cron, as sitewatch:
+#   * * * * *  sitewatch  /opt/sitewatch/bin/check 2>> /var/log/sitewatch/check.log
+#
+# Options:
+#   -v, --verbose   print each result to stdout (handy when running it by hand)
+#
+# Behaviour:
+#   - all components are checked at the same time, each with a timeout,
+#     so one slow component never holds up the others
+#   - only one run at a time: if the previous run is still going, this one skips
+#   - a component that is down is NOT an error: it is a result, saved as a row.
+#     Only problems with the checker itself go to stderr (and so to the log).
+#
+# Settings (environment variables, all optional):
+#   CHECK_TIMEOUT    seconds before a check gives up   (default: 10)
+#   SITEWATCH_DB     database name                     (default: sitewatch_db)
+#
+# Exit codes: 0 = ran (or skipped because a run was in progress), 1 = checker failed.
+
+set -euo pipefail
+
+TIMEOUT="${CHECK_TIMEOUT:-10}"
+DB="${SITEWATCH_DB:-sitewatch_db}"
+RUN_AS="${SITEWATCH_USER:-sitewatch}"
+LOCK_FILE="${CHECK_LOCK_FILE:-/run/lock/sitewatch-check.lock}"
+VERBOSE=0
+
+log() {                                           # problems with the checker itself
+    echo "$(date -Is) check: $*" >&2
+}
+
+case "${1:-}" in
+    -v|--verbose) VERBOSE=1 ;;
+    "") ;;
+    -h|--help) sed -n '3,22p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) log "unknown option '$1'"; exit 1 ;;
+esac
+
+if [[ "$(id -un)" != "$RUN_AS" ]]; then
+    log "must run as '$RUN_AS'. Try: sudo -u $RUN_AS $0"
+    exit 1
+fi
+
+# --- one run at a time ---------------------------------------------------------
+# flock holds a lock on file descriptor 9 until this script exits.
+exec 9>"$LOCK_FILE"
+if ! flock -n 9; then
+    log "previous run still in progress, skipping this one"
+    exit 0
+fi
+
+psql_q() {
+    psql -X -q -At -F $'\t' -v ON_ERROR_STOP=1 -d "$DB" "$@"
+}
+
+# --- which components to check -------------------------------------------------
+
+if ! components=$(psql_q -c "select id, url from components where is_active order by id" 2>&1); then
+    log "cannot read components from the database: $components"
+    exit 1
+fi
+
+if [[ -z "$components" ]]; then
+    log "no active components, nothing to check (did you run apply?)"
+    exit 0
+fi
+
+# every check in this round shares the round's start time
+checked_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+work_dir="$(mktemp -d)"
+trap 'rm -rf "$work_dir"' EXIT
+
+# --- check one component (runs in the background, one per component) -----------
+
+curl_error() {                                    # curl exit code -> readable reason
+    case "$1" in
+        6)  echo "could not resolve host" ;;
+        7)  echo "connection refused" ;;
+        28) echo "timeout after ${TIMEOUT}s" ;;
+        35) echo "TLS handshake failed" ;;
+        52) echo "empty reply from server" ;;
+        56) echo "connection reset" ;;
+        60) echo "TLS certificate problem" ;;
+        *)  echo "curl error $1" ;;
+    esac
+}
+
+check_one() {
+    local id="$1" url="$2" out code exit_code http seconds ms
+    set +e
+    out="$(curl -s -o /dev/null --max-time "$TIMEOUT" -w '%{http_code} %{time_total}' "$url")"
+    exit_code=$?
+    set -e
+    http="${out%% *}"
+    seconds="${out##* }"
+    ms="$(awk -v s="${seconds:-0}" 'BEGIN { printf "%d", s * 1000 + 0.5 }')"
+
+    # fields separated by '|': a tab would not work, because `read` treats tabs as
+    # whitespace and merges two in a row, losing the empty field in between
+    if [[ $exit_code -eq 0 ]]; then
+        # got an answer (any HTTP code, even 500): record the code, no error
+        printf '%s|%s|%s|\n' "$id" "$http" "$ms" > "$work_dir/$id"
+    else
+        # no answer: no status code, record why
+        printf '%s||%s|%s\n' "$id" "$ms" "$(curl_error "$exit_code")" > "$work_dir/$id"
+    fi
+}
+
+while IFS=$'\t' read -r id url; do
+    check_one "$id" "$url" &
+done <<< "$components"
+wait
+
+# --- save all results in one go ------------------------------------------------
+
+csv() {                                           # quote one value for CSV
+    local v="${1//\"/\"\"}"
+    printf '"%s"' "$v"
+}
+
+build_sql() {
+    echo "copy checks (component_id, checked_at, status_code, duration_ms, error) from stdin with (format csv);"
+    local f id code ms err
+    for f in "$work_dir"/*; do
+        IFS='|' read -r id code ms err < "$f"
+        # an empty, unquoted CSV field is stored as NULL
+        if [[ -n "$err" ]]; then err="$(csv "$err")"; fi
+        printf '%s,%s,%s,%s,%s\n' "$id" "$checked_at" "$code" "$ms" "$err"
+    done
+    printf '%s\n' '\.'
+}
+
+if ! result=$(build_sql | psql_q 2>&1); then
+    log "could not save results: $result"
+    exit 1
+fi
+
+if [[ $VERBOSE -eq 1 ]]; then
+    psql -X -d "$DB" -v ON_ERROR_STOP=1 -c "
+        select c.name, k.status_code, k.duration_ms, k.error
+        from checks k join components c on c.id = k.component_id
+        where k.checked_at = '$checked_at'
+        order by c.name"
+fi
