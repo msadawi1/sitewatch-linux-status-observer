@@ -20,8 +20,9 @@ Last check: 18:45 (20 seconds ago)
 Connection to status.example.com closed.
 ```
 
-Site Watch checks your services every minute, works out whether each one is up, slow or down, and shows it to anyone holding a viewer key, through plain SSH. No web server, no frontend, no framework. It's built from Bash, PostgreSQL, cron, systemd and OpenSSH, and every part runs with only the permissions it needs.
+Site Watch checks your services every minute, works out whether each one is up, slow or down, and shows it to anyone holding a viewer key, through plain SSH. No web server, no frontend, no framework. It's built from Bash, PostgreSQL, cron, systemd and OpenSSH, runs on a single small Azure virtual machine, and every part runs with only the permissions it needs.
 
+![Azure VM](https://img.shields.io/badge/Azure-Virtual_Machine-0078D4?logo=microsoftazure&logoColor=white)
 ![Ubuntu 24.04](https://img.shields.io/badge/Ubuntu-24.04-E95420?logo=ubuntu&logoColor=white)
 ![PostgreSQL 16](https://img.shields.io/badge/PostgreSQL-16-4169E1?logo=postgresql&logoColor=white)
 ![Bash](https://img.shields.io/badge/Bash-scripts-4EAA25?logo=gnubash&logoColor=white)
@@ -111,7 +112,27 @@ systemd/
 
 ## Installation
 
-Tested on **Ubuntu 24.04 LTS** with **PostgreSQL 16**. Every step runs on the server as an admin with `sudo`, unless it says otherwise.
+Tested on an **Azure virtual machine** (Standard B2ats v2) running **Ubuntu 24.04 LTS** with **PostgreSQL 16**. Any Ubuntu 24.04 server works; step 0 covers the Azure-specific part. From step 1 on, every step runs on the server as an admin with `sudo`, unless it says otherwise.
+
+### 0. Create the VM on Azure
+
+Create the VM from the portal's **Free services** page, so it starts from free-eligible settings.
+
+| Setting | Choice | Why |
+|---|---|---|
+| Image | Ubuntu Server 24.04 LTS | What everything here was tested on |
+| Size | **B2ats v2** (or B1s, or B2pts v2 on Arm) | Free-eligible: 750 hours a month each, for 12 months, on Azure free and student accounts. That's enough to run 24/7 |
+| Region | The closest one your subscription allows | Student subscriptions only allow a fixed list of regions. A deployment that fails with `RequestDisallowedByAzure` used a region outside it; the list is under **Policy → Assignments** |
+| Resource group | A new one, e.g. `sitewatch-rg` | Deleting the group removes everything in it |
+| Authentication | SSH public key | Password login gets disabled in step 1 anyway |
+| Inbound ports | **SSH (22) only** | The network security group is the real gatekeeper. Postgres and the services stay on `127.0.0.1` |
+| OS disk, public IP, NIC | Tick **delete with VM** | Leftover resources are the usual surprise charge |
+| Auto-shutdown | Off | The checker runs every minute, around the clock |
+
+Then:
+- **Set a budget alert** (e.g. $10) under Cost Management before anything else.
+- **The VM never sees its public IP.** Azure receives traffic on it and forwards it (NAT) to the VM's private address, which is why `ip addr` only shows something like `10.0.0.4`.
+- **To pause it, use the portal's Stop button.** That deallocates the VM and stops compute billing. Shutting down from inside the VM leaves the hardware reserved, and it's still billed. A dynamic public IP can change after a stop, so check it before you SSH in again.
 
 ### 1. Lock down SSH
 
@@ -298,6 +319,7 @@ Real problems hit while building this:
 
 | Symptom | Cause |
 |---|---|
+| **Creating the Azure VM fails with `RequestDisallowedByAzure`** | The region isn't allowed for the subscription. Student subscriptions only allow a fixed list of regions; check **Policy → Assignments** |
 | A service fails with **`status=203/EXEC`** | systemd couldn't start the program: the file is missing, has no execute bit, or has Windows line endings in the shebang. Check `journalctl -u <unit>` |
 | **The cron job does nothing, and the log stays empty** | The log file was created by root, so `sitewatch` can't append and cron throws the error away. New files take the creator's owner, not the folder's |
 | **`systemctl status postgresql` says `active (exited)`** | That unit is only a wrapper. The real database is `postgresql@16-main`. Use `pg_lsclusters` |
@@ -307,4 +329,15 @@ Real problems hit while building this:
 
 ---
 
-Built as a hands-on project consolidating Linux, SSH, Git and PostgreSQL.
+## Roadmap
+
+The schema already supports more than the board shows:
+
+- **Incidents:** open automatically when a component degrades, with staff updates (Investigating → Identified → Monitoring → Resolved). The tables, the partial unique index and the timeline trigger already exist.
+- **90-day uptime history** on the board.
+- **Scheduled maintenance** that doesn't count against uptime.
+- **Alerts** by email or chat.
+
+---
+
+Built by Mohammed as a hands-on project consolidating Linux, SSH, Git and PostgreSQL.
